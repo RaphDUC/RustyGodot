@@ -89,6 +89,12 @@ struct DelayedPacket {
     data: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct StateSnapshot {
+    timestamp: f64, // Client-side time when the packet was received/intended for
+    pos: Vector2,
+}
+
 /// The Main Manager for Network Replication in Godot.
 ///
 /// It handles:
@@ -112,6 +118,13 @@ struct NetworkManager {
 
     // Local Client ID
     local_network_id: u32,
+
+    // --- Interpolation Buffers ---
+    // Mapping: NetworkID -> Queue of snapshots
+    state_buffers: HashMap<u32, VecDeque<StateSnapshot>>,
+
+    #[export]
+    interpolation_delay_ms: f64, // The arbitrary delay applied to remote entities (e.g. 100ms)
 
     // --- Prediction Tuning ---
     #[export]
@@ -297,6 +310,8 @@ impl INode for NetworkManager {
             input_history: VecDeque::with_capacity(20),
             ping_timer: 0.0,
             local_network_id: 0, // 0 means unassigned
+            state_buffers: HashMap::new(),
+            interpolation_delay_ms: 100.0, // Default to 100ms delay for remote entities
             correction_threshold: 40.0,
             correction_smoothing: 0.1,
             simulated_latency_ms: 0.0,
@@ -462,14 +477,11 @@ impl INode for NetworkManager {
                                      )
                                  };
 
-                                 // Update Node position
-                                 if let Some(node) = self.network_objects.get_mut(&net_id) {
-                                     let server_pos = Vector2::new(px, py);
-                                     if net_id != self.local_network_id {
-                                         // Remote player: straight update (could be interpolated too, but basic for now)
-                                         node.set_position(server_pos);
-                                     } else {
-                                         // Local player: "Less naive" Client-Side Prediction Correction
+                                 let server_pos = Vector2::new(px, py);
+
+                                 if net_id == self.local_network_id {
+                                     // Update Node position locally (Local player: "Less naive" Client-Side Prediction Correction)
+                                     if let Some(node) = self.network_objects.get_mut(&net_id) {
                                          let current_pos = node.get_position();
                                          let distance = current_pos.distance_to(server_pos);
 
@@ -477,8 +489,23 @@ impl INode for NetworkManager {
                                          if distance > self.correction_threshold {
                                              let new_pos = current_pos.lerp(server_pos, self.correction_smoothing);
                                              node.set_position(new_pos);
-                                             godot_print!("[Client] Prediction divergence ({} > {}). Correcting position...", distance, self.correction_threshold);
+                                             //  godot_print!("[Client] Prediction divergence ({} > {}). Correcting position...", distance, self.correction_threshold);
                                          }
+                                     }
+                                 } else {
+                                     // Remote Player: Store in Interpolation Buffer rather than applying directly
+                                     let receive_time = current_time;
+                                     let buffer = self.state_buffers.entry(net_id).or_insert_with(VecDeque::new);
+
+                                     // Add to buffer
+                                     buffer.push_back(StateSnapshot {
+                                         timestamp: receive_time,
+                                         pos: server_pos,
+                                     });
+
+                                     // Keep buffer size manageable (e.g. max 20 snapshots)
+                                     if buffer.len() > 20 {
+                                         buffer.pop_front();
                                      }
                                  }
                              }
@@ -492,6 +519,7 @@ impl INode for NetworkManager {
                                  if let Some(mut node) = self.network_objects.remove(&net_id) {
                                      node.queue_free();
                                  }
+                                 self.state_buffers.remove(&net_id);
                              }
                          }
                          _ => {
@@ -514,6 +542,51 @@ impl INode for NetworkManager {
         // 2. Process Lab 1 Spawns
         for (net_id, type_id, x, y) in spawns_to_process {
             self.process_spawn(net_id, type_id, x, y);
+        }
+
+        // 3. Process Entity Interpolation for remote players
+        let render_time = current_time - self.interpolation_delay_ms;
+
+        for (&net_id, buffer) in self.state_buffers.iter_mut() {
+            if net_id == self.local_network_id { continue; } // Don't interpolate ourselves
+
+            if let Some(node) = self.network_objects.get_mut(&net_id) {
+                // Find the two snapshots that surround render_time
+                let mut prev_snap: Option<&StateSnapshot> = None;
+                let mut next_snap: Option<&StateSnapshot> = None;
+
+                for i in 0..buffer.len() {
+                    let snap = &buffer[i];
+                    if snap.timestamp <= render_time {
+                        prev_snap = Some(snap);
+                    } else {
+                        next_snap = Some(snap);
+                        break;
+                    }
+                }
+
+                // Apply interpolation based on what we found in the buffer
+                if let (Some(prev), Some(next)) = (prev_snap, next_snap) {
+                    // We have surrounding points -> Lerp between them
+                    let time_diff = next.timestamp - prev.timestamp;
+                    if time_diff > 0.001 {
+                        let t = (render_time - prev.timestamp) / time_diff;
+                        let interpolated_pos = prev.pos.lerp(next.pos, t as f32);
+                        node.set_position(interpolated_pos);
+                    }
+                } else if let Some(prev) = prev_snap {
+                    // We only have old points (server is lagging behind render time) -> Extrapolate or just stick to the latest
+                    node.set_position(prev.pos);
+                } else if let Some(next) = next_snap {
+                    // We only have future points (rare, might happen at spawn) -> just snap to next
+                    node.set_position(next.pos);
+                }
+
+                // Cleanup old snapshots that are no longer needed
+                while buffer.len() > 2 && buffer[1].timestamp < render_time {
+                    buffer.pop_front(); // Remove the oldest, keep at least one before render_time.
+                }
+            }
         }
     }
 }
