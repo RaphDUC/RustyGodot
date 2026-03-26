@@ -50,6 +50,18 @@ pub struct SpawnPacket {
     pub y: f32,
 }
 
+/// Packet sent by Server to *ALL* clients to update an entity's position.
+/// This corresponds to the "State" or "Snapshot" of the Lab 3 preparation.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct StatePacket {
+    pub packet_type: u8, // = 5
+    pub network_id: NetworkID,
+    pub x: f32,
+    pub y: f32,
+    pub last_processed_sequence: u32, // Added for Server Reconciliation
+}
+
 /// Bitbox (1 byte) for input compression
 /// Bits:
 /// 0: UP
@@ -103,16 +115,6 @@ pub struct PingResponse {
     pub t1: u64,
 }
 
-/// Packet sent by Server to *ALL* clients to update an entity's position.
-/// This corresponds to the "State" or "Snapshot" of the Lab 3 preparation.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct StatePacket {
-    pub packet_type: u8, // = 5
-    pub network_id: NetworkID,
-    pub x: f32,
-    pub y: f32,
-}
 
 /// Packet sent by the client to notify the server of a graceful disconnection.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]

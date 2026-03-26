@@ -33,6 +33,7 @@ struct StatePacket {
     network_id: u32,
     x: f32,
     y: f32,
+    last_processed_sequence: u32,
 }
 
 /// Bitbox (1 byte) for input compression
@@ -118,6 +119,9 @@ struct NetworkManager {
 
     // Local Client ID
     local_network_id: u32,
+
+    // Server Reconciliation
+    last_processed_sequence: u32,
 
     // --- Interpolation Buffers ---
     // Mapping: NetworkID -> Queue of snapshots
@@ -240,15 +244,14 @@ impl NetworkManager {
 
         let mask_u8 = input_mask as u8;
 
-        // Debug to verify what GDScript is sending.
-        if mask_u8 != 0 && self.sequence_id % 60 == 0 {
-             godot_print!("[Client] Sending Input Mask: {:#010b} (Seq: {})", mask_u8, self.sequence_id);
-        }
-
         // 1. UPDATE HISTORY FIRST
         let new_state = InputState(mask_u8);
+
+        // We push current input to history with its sequence ID
+        // Note: Currently we don't store seq in InputState, but we know the front is `sequence_id`,
+        // and older ones are `sequence_id - 1`, etc.
         self.input_history.push_front(new_state);
-        if self.input_history.len() > 20 {
+        if self.input_history.len() > 60 { // Increase history size for reconciliation
             self.input_history.pop_back();
         }
 
@@ -310,6 +313,7 @@ impl INode for NetworkManager {
             input_history: VecDeque::with_capacity(20),
             ping_timer: 0.0,
             local_network_id: 0, // 0 means unassigned
+            last_processed_sequence: 0,
             state_buffers: HashMap::new(),
             interpolation_delay_ms: 100.0, // Default to 100ms delay for remote entities
             correction_threshold: 40.0,
@@ -468,28 +472,64 @@ impl INode for NetworkManager {
                          5 => {
                              if size >= std::mem::size_of::<StatePacket>() {
                                  // Unsafe read for packed struct
-                                 let (net_id, px, py) = unsafe {
+                                 let (net_id, px, py, ack_seq) = unsafe {
                                      let raw = buffer.as_ptr() as *const StatePacket;
                                      (
                                          std::ptr::read_unaligned(std::ptr::addr_of!((*raw).network_id)),
                                          std::ptr::read_unaligned(std::ptr::addr_of!((*raw).x)),
                                          std::ptr::read_unaligned(std::ptr::addr_of!((*raw).y)),
+                                         std::ptr::read_unaligned(std::ptr::addr_of!((*raw).last_processed_sequence)),
                                      )
                                  };
 
                                  let server_pos = Vector2::new(px, py);
 
                                  if net_id == self.local_network_id {
-                                     // Update Node position locally (Local player: "Less naive" Client-Side Prediction Correction)
-                                     if let Some(node) = self.network_objects.get_mut(&net_id) {
-                                         let current_pos = node.get_position();
-                                         let distance = current_pos.distance_to(server_pos);
+                                     // Server Reconciliation
+                                     if ack_seq > self.last_processed_sequence {
+                                         self.last_processed_sequence = ack_seq;
 
-                                         // If local prediction diverges too much from server truth, correct it smoothly
-                                         if distance > self.correction_threshold {
-                                             let new_pos = current_pos.lerp(server_pos, self.correction_smoothing);
-                                             node.set_position(new_pos);
-                                             //  godot_print!("[Client] Prediction divergence ({} > {}). Correcting position...", distance, self.correction_threshold);
+                                         if let Some(node) = self.network_objects.get_mut(&net_id) {
+                                             // 1. Snap to authoritative position
+                                             let mut current_sim_pos = server_pos;
+
+                                             // 2. Re-apply unacknowledged inputs
+                                             // seq corresponding to input_history[i] is self.sequence_id - 1 - i
+                                             let current_seq = self.sequence_id;
+
+                                             // Speed must match server exactly. Hardcoded for now but should be synchronized.
+                                             let speed = 200.0;
+                                             let delta_t = 1.0 / 60.0; // Server tick rate assumption
+
+                                             for i in (0..self.input_history.len()).rev() {
+                                                 let seq_for_input = current_seq - 1 - (i as u32);
+
+                                                 if seq_for_input > ack_seq {
+                                                     let input_state = self.input_history[i];
+                                                     let mut direction = Vector2::ZERO;
+
+                                                     if (input_state.0 & (1 << 0)) != 0 { direction.y -= 1.0; } // UP
+                                                     if (input_state.0 & (1 << 1)) != 0 { direction.y += 1.0; } // DOWN
+                                                     if (input_state.0 & (1 << 2)) != 0 { direction.x -= 1.0; } // LEFT
+                                                     if (input_state.0 & (1 << 3)) != 0 { direction.x += 1.0; } // RIGHT
+
+                                                     if direction != Vector2::ZERO {
+                                                         direction = direction.normalized();
+                                                     }
+
+                                                     current_sim_pos += direction * speed * delta_t;
+                                                 }
+                                             }
+
+                                             // Apply the reconciled position gracefully
+                                             let predicted_dist = node.get_position().distance_to(current_sim_pos);
+                                             if predicted_dist > self.correction_threshold {
+                                                let new_pos = node.get_position().lerp(current_sim_pos, self.correction_smoothing);
+                                                node.set_position(new_pos);
+                                             } else {
+                                                // If deviation is small, client local physics is trusted for smoothness.
+                                                // Setting exactly to current_sim_pos can cause micro-jitters if local physics tick != network tick
+                                             }
                                          }
                                      }
                                  } else {

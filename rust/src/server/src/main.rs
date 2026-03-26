@@ -58,6 +58,7 @@ struct NetworkedEntity {
 #[derive(Component, Default)]
 struct PlayerInput {
     current: InputState,
+    last_sequence: u32, // Added to keep track of sequence ID that generated the state
 }
 
 fn main() {
@@ -147,6 +148,7 @@ fn handle_network(
                                 if let Some(entity) = state.addr_to_entity.get(&sender_addr) {
                                     if let Ok((_entry_entity, mut input_comp, _, _)) = query.get_mut(*entity) {
                                         input_comp.current = latest_input;
+                                        input_comp.last_sequence = input_packet.sequence; // Store sequence
 
                                         // MODULAR LOG (Debug)
                                         // Display the received binary mask every frame if not null
@@ -324,7 +326,7 @@ fn move_players(time: Res<Time>, mut query: Query<(&mut Transform, &PlayerInput)
 
 /// System: Broadcast State (Snapshot).
 /// Runs every frame (60Hz). In prod, maybe 20Hz.
-fn broadcast_state(mut state: ResMut<ServerState>, time: Res<Time>, query: Query<(&Transform, &NetworkedEntity)>) {
+fn broadcast_state(mut state: ResMut<ServerState>, time: Res<Time>, query: Query<(&Transform, &NetworkedEntity, Option<&PlayerInput>)>) {
     // Configurable variable for broadcast frequency (Hz).
     let broadcast_interval: f32 = 1.0 / state.broadcast_rate_hz;
 
@@ -334,12 +336,19 @@ fn broadcast_state(mut state: ResMut<ServerState>, time: Res<Time>, query: Query
     }
     state.broadcast_timer -= broadcast_interval;
 
-    for (transform, net_entity) in query.iter() {
+    for (transform, net_entity, input_opt) in query.iter() {
+        let last_seq = if let Some(input) = input_opt {
+            input.last_sequence
+        } else {
+            0
+        };
+
         let packet = StatePacket {
             packet_type: PacketType::StateUpdate as u8,
             network_id: net_entity.id,
             x: transform.translation.x,
             y: transform.translation.y,
+            last_processed_sequence: last_seq,
         };
 
         let data = unsafe {
