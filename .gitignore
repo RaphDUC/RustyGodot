@@ -20,6 +20,7 @@ Cargo.lock
 # ------------------------------------------------------------------------------
 # The folder where we download the Godot Editor binary
 .godot_bin/
+xtask_metadata/
 
 # The folder where the GDExtension binaries (.dll, .so, .dylib) are copied to
 game/bin/
@@ -50,3 +51,4 @@ builds/
 .Trashes
 ehthumbs.db
 Thumbs.db
+rust/GodotCPPArchive/

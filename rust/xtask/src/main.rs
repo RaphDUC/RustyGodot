@@ -1,3 +1,15 @@
+//! # XTask Build System
+//!
+//! This is a custom build tool written in Rust effectively replacing Makefiles or Shell scripts.
+//! It handles:
+//! - Downloading Godot Engine.
+//! - Downloading Export Templates.
+//! - Building Rust crates (Server & Client).
+//! - Generating GDExtension configuration.
+//! - Packaging the game for release.
+//!
+//! Usage: `cargo xtask <command>`
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -20,6 +32,7 @@ struct Cli {
     command: Commands,
 }
 
+/// Commands available in the build system.
 #[derive(Subcommand)]
 enum Commands {
     /// Download and setup Godot Engine and Templates
@@ -33,13 +46,15 @@ enum Commands {
     Editor,
     /// Build and run the game
     Run,
-    /// Build and Package the game for distribution
+    /// Build and Package the game for distribution (creates an executable)
     Package
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let root = std::env::current_dir()?;
+    // Instead of using current_dir directly, find the workspace root.
+    // This allows running xtask from subdirectories (e.g. rust/).
+    let root = find_project_root()?;
 
     match cli.command {
         Commands::Setup => setup_godot(&root)?,
@@ -60,6 +75,27 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn find_project_root() -> Result<PathBuf> {
+    let current_dir = std::env::current_dir()?;
+    let mut path = current_dir.as_path();
+
+    loop {
+        // Unambiguous check: The root must contain "Cargo.lock" (workspace)
+        // AND "game" (Godot project) AND "rust" (Source code).
+        if path.join("Cargo.lock").exists()
+            && path.join("game").exists()
+            && path.join("rust").exists()
+        {
+            return Ok(path.to_path_buf());
+        }
+
+        match path.parent() {
+            Some(p) => path = p,
+            None => anyhow::bail!("Could not find project root! Are you running this inside the project folder?"),
+        }
+    }
 }
 
 fn get_os_info() -> (&'static str, &'static str) {
@@ -204,10 +240,12 @@ windows.release.x86_64 = "res://bin/{crate_name}/windows/{crate_name}.dll"
 }
 
 fn build_and_install(root: &Path, release: bool) -> Result<()> {
-    println!("Building Rust crates...");
-    
+    println!("Building Rust crates (Game only)...");
+
     let mut cmd = Command::new("cargo");
+    cmd.current_dir(root);
     cmd.arg("build");
+    cmd.arg("-p").arg("game");
     if release {
         cmd.arg("--release");
     }

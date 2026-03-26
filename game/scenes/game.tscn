@@ -1,10 +1,15 @@
 [gd_scene format=3 uid="uid://cufci385o641h"]
 
-[ext_resource type="Texture2D" uid="uid://1d7eexj3bkmg" path="res://icon.svg" id="1_uwrxv"]
+[ext_resource type="Script" uid="uid://dkun85ussd66s" path="res://scripts/test_network.gd" id="1_uwrxv"]
+
+[sub_resource type="CanvasTexture" id="CanvasTexture_uwrxv"]
 
 [node name="Game" type="Node" unique_id=351752518]
 
-[node name="Player" type="Player" parent="." unique_id=841571595]
-texture = ExtResource("1_uwrxv")
+[node name="NetworkManager" type="NetworkManager" parent="." unique_id=792073513]
+script = ExtResource("1_uwrxv")
 
-[node name="Camera2D" type="Camera2D" parent="Player" unique_id=1155557280]
+[node name="Sprite2D" type="Sprite2D" parent="." unique_id=137724594]
+position = Vector2(-250, 0)
+scale = Vector2(144.5, 63.5)
+texture = SubResource("CanvasTexture_uwrxv")

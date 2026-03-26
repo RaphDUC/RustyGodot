@@ -10,6 +10,8 @@
       <excludeFolder url="file://$MODULE_DIR$/game/.godot" />
       <excludeFolder url="file://$MODULE_DIR$/game/bin" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
+      <excludeFolder url="file://$MODULE_DIR$/rust/src/game/target" />
+      <excludeFolder url="file://$MODULE_DIR$/rust/src/server/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

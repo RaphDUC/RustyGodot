@@ -1,0 +1,13 @@
+[gd_resource type="Resource" script_class="InputMapping" load_steps=2 format=3 uid="uid://b8q8q8q8q8q8"]
+
+[ext_resource type="Script" path="res://scripts/input_mapping.gd" id="1_mapping"]
+
+[resource]
+script = ExtResource("1_mapping")
+action_map = {
+"ui_accept": 4,
+"ui_down": 1,
+"ui_left": 2,
+"ui_right": 3,
+"ui_up": 0
+}
