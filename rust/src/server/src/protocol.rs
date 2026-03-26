@@ -89,15 +89,20 @@ impl fmt::Display for InputState {
     }
 }
 
+/// A Run-Length Encoded block of inputs.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
+pub struct RleInput {
+    pub state: InputState,
+    pub count: u8,
+}
+
 /// Packet sent by Client to Server containing input history.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct InputPacket {
     pub packet_type: u8, // = 2
     pub sequence: u32,
-    /// Fixed size array for zero-allocation history (20 frames)
-    /// We use heapless logic manually or just a fixed array
-    pub inputs: [InputState; 20], 
-    pub count: u8, // How many inputs are valid in the array (usually 20, but can be less at start)
+    /// Run-Length Encoded history to save UDP bandwidth
+    pub inputs: Vec<RleInput>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]

@@ -7,6 +7,7 @@
 [node name="Game" type="Node" unique_id=351752518]
 
 [node name="NetworkManager" type="NetworkManager" parent="." unique_id=792073513]
+simulated_latency_ms = 30.0
 script = ExtResource("1_uwrxv")
 
 [node name="Sprite2D" type="Sprite2D" parent="." unique_id=137724594]

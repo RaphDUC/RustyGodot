@@ -47,16 +47,23 @@ impl InputState {
     }
 }
 
+/// A Run-Length Encoded block of inputs.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
+struct RleInput {
+    state: InputState,
+    count: u8,
+}
+
 /// Packet sent by Client to Server containing input history.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct InputPacket {
     pub packet_type: u8, // = 2
     pub sequence: u32,
-    /// Fixed size array for zero-allocation history (20 frames)
-    pub inputs: [InputState; 20], 
-    pub count: u8, 
+    /// Run-Length Encoded history to save UDP bandwidth
+    pub inputs: Vec<RleInput>,
 }
 
+/// Packet sent by Client to Server to measure latency (Ping).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 struct PingRequest {
     pub packet_type: u8, // = 3
@@ -64,6 +71,7 @@ struct PingRequest {
     pub t0: u64,
 }
 
+/// Packet sent by Server to Client in response to PingRequest, containing timestamps for RTT calculation.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 struct PingResponse {
     pub packet_type: u8, // = 4
@@ -72,6 +80,7 @@ struct PingResponse {
     pub t1: u64,
 }
 
+/// Packet sent by Server to Client to update entity state (position, etc.).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 struct DisconnectPacket {
     pub packet_type: u8, // = 6
@@ -83,6 +92,7 @@ struct DisconnectPacket {
 // This allows us to map a generic TypeID (integer) to a specific Scene instantiation logic.
 type CreationLambda = Box<dyn Fn() -> Gd<Node2D>>;
 
+/// Packet sent by Server to Client to update entity state (position, etc.).
 #[derive(Clone)]
 struct DelayedPacket {
     deliver_time: f64,
@@ -90,6 +100,7 @@ struct DelayedPacket {
     data: Vec<u8>,
 }
 
+/// Snapshot of an entity's state at a given time, used for interpolation of remote entities.
 #[derive(Clone)]
 struct StateSnapshot {
     timestamp: f64, // Client-side time when the packet was received/intended for
@@ -145,6 +156,7 @@ struct NetworkManager {
     base: Base<Node>,
 }
 
+/// Note: We moved critical initialization (socket, registry) to `init()` to ensure they are set up even if GDScript overrides `_ready()`.
 #[godot_api]
 impl NetworkManager {
     // Porting signals from C++:
@@ -244,6 +256,11 @@ impl NetworkManager {
 
         let mask_u8 = input_mask as u8;
 
+        // Debug to verify what GDScript is sending.
+        if mask_u8 != 0 && self.sequence_id % 60 == 0 {
+             godot_print!("[Client] Sending Input Mask: {:#010b} (Seq: {})", mask_u8, self.sequence_id);
+        }
+
         // 1. UPDATE HISTORY FIRST
         let new_state = InputState(mask_u8);
 
@@ -255,19 +272,36 @@ impl NetworkManager {
             self.input_history.pop_back();
         }
 
-        // 2. CONSTRUCT PACKET
-        let mut inputs_array = [InputState::default(); 20];
-        let count = self.input_history.len().min(20);
+        // 2. CONSTRUCT PACKET (RLE Compression)
+        let mut rle_inputs = Vec::new();
 
-        for (i, state) in self.input_history.iter().take(20).enumerate() {
-            inputs_array[i] = *state;
+        if !self.input_history.is_empty() {
+            let mut current_state = self.input_history[0];
+            let mut current_count = 1;
+
+            for state in self.input_history.iter().skip(1) {
+                if state.0 == current_state.0 && current_count < 255 {
+                    current_count += 1;
+                } else {
+                    rle_inputs.push(RleInput { state: current_state, count: current_count });
+                    // Limit compression to the last 20 changes max to avoid huge packets
+                    if rle_inputs.len() >= 20 {
+                        break;
+                    }
+                    current_state = *state;
+                    current_count = 1;
+                }
+            }
+
+            if rle_inputs.len() < 20 {
+                rle_inputs.push(RleInput { state: current_state, count: current_count });
+            }
         }
 
         let packet = InputPacket {
             packet_type: 2, // Input Packet
             sequence: self.sequence_id,
-            inputs: inputs_array,
-            count: count as u8,
+            inputs: rle_inputs,
         };
 
         // RELIABLE SOLUTION: Use bincode like the server.

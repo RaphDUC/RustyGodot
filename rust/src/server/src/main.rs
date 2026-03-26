@@ -139,10 +139,9 @@ fn handle_network(
                             *last_seq = input_packet.sequence;
 
                             // Process inputs
-                            if (input_packet.count as usize) > 0 {
+                            if !input_packet.inputs.is_empty() {
                                 // FIX: Client sends newest input at index 0 (push_front)
-                                // Old code reading last_idx was reading the oldest input of the history!
-                                let latest_input = input_packet.inputs[0];
+                                let latest_input = input_packet.inputs[0].state;
 
                                 // Apply to the correct entity
                                 if let Some(entity) = state.addr_to_entity.get(&sender_addr) {
