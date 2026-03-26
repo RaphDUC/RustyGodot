@@ -1,7 +1,7 @@
 mod protocol;
 
 use bevy::prelude::*;
-use bevy::app::ScheduleRunnerPlugin;
+use bevy::app::{ScheduleRunnerPlugin, RunMode};
 use bincode;
 use snl::GameSocket;
 use std::collections::HashMap;
@@ -37,6 +37,13 @@ struct ServerState {
     client_last_sequence: HashMap<String, u32>,
     /// Timer accumulation for broadcast frequency control (Optimisation Lab 2)
     broadcast_timer: f32,
+    /// Configurable broadcast rate (Hz)
+    broadcast_rate_hz: f32,
+}
+
+#[derive(Resource)]
+struct ServerConfig {
+    tick_rate_hz: f64,
 }
 
 /// Component added to every entity that should be synchronized over the network.
@@ -63,13 +70,23 @@ fn main() {
 
     info!("Starting RustyGodot Server...");
 
+    // Read config from args or environment if needed, here we default to 60.0, but we can make it configurable.
+    let args: Vec<String> = std::env::args().collect();
+
+    let tick_rate_hz: f64 = args.get(1).and_then(|t| t.parse().ok()).unwrap_or(60.0);
+    let broadcast_rate_hz: f32 = args.get(2).and_then(|t| t.parse().ok()).unwrap_or(60.0);
+
+    info!("Tick rate set to {} Hz", tick_rate_hz);
+    info!("Broadcast rate set to {} Hz", broadcast_rate_hz);
+
     // 1. Initialize SNL: Bind to port 4242 on all interfaces.
     let socket = GameSocket::new("0.0.0.0:4242").expect("Failed to bind SNL socket");
 
     // 2. Configure Bevy App
     App::new()
+        .insert_resource(ServerConfig { tick_rate_hz })
         .add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(
-            Duration::from_secs_f64(1.0 / 60.0),
+            Duration::from_secs_f64(1.0 / tick_rate_hz),
         )))
         .insert_resource(ServerState {
             socket,
@@ -80,6 +97,7 @@ fn main() {
             last_heartbeat: HashMap::new(),
             client_last_sequence: HashMap::new(),
             broadcast_timer: 0.0,
+            broadcast_rate_hz,
         })
         // AJOUT: Le système move_players était manquant ! Sans lui, le serveur reçoit les inputs
         // mais ne met jamais à jour la position des entités, donc elles restent à (0,0).
@@ -308,9 +326,7 @@ fn move_players(time: Res<Time>, mut query: Query<(&mut Transform, &PlayerInput)
 /// Runs every frame (60Hz). In prod, maybe 20Hz.
 fn broadcast_state(mut state: ResMut<ServerState>, time: Res<Time>, query: Query<(&Transform, &NetworkedEntity)>) {
     // Configurable variable for broadcast frequency (Hz).
-    // Requested to be 60.0 instead of 20.0.
-    let broadcast_rate_hz: f32 = 60.0;
-    let broadcast_interval: f32 = 1.0 / broadcast_rate_hz;
+    let broadcast_interval: f32 = 1.0 / state.broadcast_rate_hz;
 
     state.broadcast_timer += time.delta_secs();
     if state.broadcast_timer < broadcast_interval {
@@ -394,4 +410,3 @@ fn handle_timeouts(mut commands: Commands, mut state: ResMut<ServerState>, time:
         }
     }
 }
-

@@ -2,8 +2,7 @@ use godot::classes::{INode, Node, Node2D, PackedScene, Time};
 use godot::prelude::*;
 use serde::{Deserialize, Serialize};
 use snl::GameSocket;
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 struct MyExtension;
 
@@ -83,6 +82,13 @@ struct DisconnectPacket {
 // This allows us to map a generic TypeID (integer) to a specific Scene instantiation logic.
 type CreationLambda = Box<dyn Fn() -> Gd<Node2D>>;
 
+#[derive(Clone)]
+struct DelayedPacket {
+    deliver_time: f64,
+    sender_addr: String,
+    data: Vec<u8>,
+}
+
 /// The Main Manager for Network Replication in Godot.
 ///
 /// It handles:
@@ -106,6 +112,18 @@ struct NetworkManager {
 
     // Local Client ID
     local_network_id: u32,
+
+    // --- Prediction Tuning ---
+    #[export]
+    correction_threshold: f32, // Distance threshold before forcing a correction
+
+    #[export]
+    correction_smoothing: f32, // Lerp factor for smooth correction (0.0 to 1.0)
+
+    #[export]
+    simulated_latency_ms: f64, // Artificial lag in milliseconds for testing
+
+    incoming_queue: Vec<DelayedPacket>,
 
     base: Base<Node>,
 }
@@ -279,6 +297,10 @@ impl INode for NetworkManager {
             input_history: VecDeque::with_capacity(20),
             ping_timer: 0.0,
             local_network_id: 0, // 0 means unassigned
+            correction_threshold: 40.0,
+            correction_smoothing: 0.1,
+            simulated_latency_ms: 0.0,
+            incoming_queue: Vec::new(),
         }
     }
 
@@ -316,40 +338,54 @@ impl INode for NetworkManager {
             self.send_ping();
         }
 
-        // NOTE: Automatic input collection removed here.
-        // It is now handled by GDScript (Player.gd) calling send_input().
-
-        let mut spawns_to_process = Vec::new();
-
-        // We need to capture the base (for emitting signals) to avoid borrowing self mutably twice
-        // But emitting requires mut self usually.
-        // Strategy: Collection into a buffer, then process.
-
-        let mut received_packets: Vec<(String, i32, Vec<u8>)> = Vec::new();
+        let current_time = godot::classes::Time::singleton().get_ticks_msec() as f64;
 
         if let Some(socket) = &mut self.socket {
             let mut buffer = [0u8; 1024];
 
-            // Non-blocking poll loop
+            // Non-blocking poll loop: Instead of processing immediately, we add to queue
             while let Some((size, sender_addr)) = socket.poll(&mut buffer) {
-                // Store for signal emission
-                let data_vec = buffer[0..size].to_vec();
+                let deliver_time = current_time + self.simulated_latency_ms;
+                self.incoming_queue.push(DelayedPacket {
+                    deliver_time,
+                    sender_addr,
+                    data: buffer[0..size].to_vec(),
+                });
+            }
+        }
 
-                // Parse sender address (assuming snl returns "IP:PORT" string)
-                let parts: Vec<&str> = sender_addr.split(':').collect();
-                let ip = parts.get(0).unwrap_or(&"0.0.0.0").to_string();
-                let port = parts.get(1).unwrap_or(&"0").parse::<i32>().unwrap_or(0);
+        // Collect packets ready to be processed
+        let mut ready_packets = Vec::new();
+        self.incoming_queue.retain(|packet| {
+            if packet.deliver_time <= current_time {
+                ready_packets.push(packet.clone());
+                false // remove from queue
+            } else {
+                true // keep in queue
+            }
+        });
 
-                received_packets.push((ip, port, data_vec.clone()));
+        let mut spawns_to_process = Vec::new();
+        let mut received_events: Vec<(String, i32, Vec<u8>)> = Vec::new();
 
-                // --- Lab 1 Logic: Check for SPAWN packet ---
-                // We now check packet type first (OpCode) for Lab 2 compatibility
-                if size > 0 {
-                    let packet_type = buffer[0];
-                    if packet_type == 1 {
-                        // godot_print!("[Client] Received PacketType: SPAWN (Size: {})", size);
-                    }
-                    match packet_type {
+        // Process ready packets
+        for packet in ready_packets {
+            let size = packet.data.len();
+            let data_vec = packet.data;
+            let sender_addr = packet.sender_addr;
+
+            // Parse sender address (assuming snl returns "IP:PORT" string)
+            let parts: Vec<&str> = sender_addr.split(':').collect();
+            let ip = parts.get(0).unwrap_or(&"0.0.0.0").to_string();
+            let port = parts.get(1).unwrap_or(&"0").parse::<i32>().unwrap_or(0);
+
+            received_events.push((ip, port, data_vec.clone()));
+
+            if size > 0 {
+                let packet_type = data_vec[0];
+                let buffer = data_vec.as_slice();
+
+                match packet_type {
                          // Welcome (Lab 2 Fix)
                          0 => {
                              if size >= std::mem::size_of::<WelcomePacket>() {
@@ -428,12 +464,21 @@ impl INode for NetworkManager {
 
                                  // Update Node position
                                  if let Some(node) = self.network_objects.get_mut(&net_id) {
-                                     // FIX: Do not overwrite local player position with server position (which is lagging).
-                                     // This prevents "Rubber Banding" / Jitter due to local prediction.
-                                     // In Lab 3, this will be replaced by Reconciliation (replaying inputs).
-                                     // For now (Lab 2), logic: Local moves locally, Server authoritative just for others.
+                                     let server_pos = Vector2::new(px, py);
                                      if net_id != self.local_network_id {
-                                         node.set_position(Vector2::new(px, py));
+                                         // Remote player: straight update (could be interpolated too, but basic for now)
+                                         node.set_position(server_pos);
+                                     } else {
+                                         // Local player: "Less naive" Client-Side Prediction Correction
+                                         let current_pos = node.get_position();
+                                         let distance = current_pos.distance_to(server_pos);
+
+                                         // If local prediction diverges too much from server truth, correct it smoothly
+                                         if distance > self.correction_threshold {
+                                             let new_pos = current_pos.lerp(server_pos, self.correction_smoothing);
+                                             node.set_position(new_pos);
+                                             godot_print!("[Client] Prediction divergence ({} > {}). Correcting position...", distance, self.correction_threshold);
+                                         }
                                      }
                                  }
                              }
@@ -455,10 +500,9 @@ impl INode for NetworkManager {
                     }
                 }
             }
-        }
 
         // 1. Emit signals (for generic GDScript usage)
-        for (ip, port, data) in received_packets {
+        for (ip, port, data) in received_events {
              let packed_data = PackedByteArray::from(data.as_slice());
              self.base_mut().emit_signal("packet_received", &[
                  ip.to_variant(),
