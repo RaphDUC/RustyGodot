@@ -86,6 +86,7 @@ fn main() {
     // 2. Configure Bevy App
     App::new()
         .insert_resource(ServerConfig { tick_rate_hz })
+        .insert_resource(Time::<Fixed>::from_hz(tick_rate_hz))
         .add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(
             Duration::from_secs_f64(1.0 / tick_rate_hz),
         )))
@@ -100,9 +101,8 @@ fn main() {
             broadcast_timer: 0.0,
             broadcast_rate_hz,
         })
-        // AJOUT: Le système move_players était manquant ! Sans lui, le serveur reçoit les inputs
-        // mais ne met jamais à jour la position des entités, donc elles restent à (0,0).
-        .add_systems(Update, (handle_network, move_players, broadcast_state, handle_timeouts))
+        .add_systems(Update, (handle_network, broadcast_state, handle_timeouts))
+        .add_systems(FixedUpdate, move_players)
         .run();
 }
 
@@ -282,7 +282,7 @@ fn handle_network(
 }
 
 /// System: Apply Inputs to Movement
-fn move_players(time: Res<Time>, mut query: Query<(&mut Transform, &PlayerInput)>) {
+fn move_players(time: Res<Time<Fixed>>, mut query: Query<(&mut Transform, &PlayerInput)>) {
     const SPEED: f32 = 200.0; // Pixels per second
     let delta = time.delta_secs();
     
