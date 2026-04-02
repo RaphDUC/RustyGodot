@@ -18,6 +18,7 @@ pub enum PacketType {
     PingResponse = 4,
     StateUpdate = 5,
     Disconnect = 6,
+    WorldState = 7,
 }
 
 /// Packet sent by the server to assigning a NetworkID to a connecting client.
@@ -57,6 +58,21 @@ pub struct StatePacket {
     pub x: f32,
     pub y: f32,
     pub last_processed_sequence: u32, // Added for Server Reconciliation
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct EntityState {
+    pub network_id: NetworkID,
+    pub type_id: u32,
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorldStatePacket {
+    pub packet_type: u8, // = 7
+    pub ack_sequence: u32,
+    pub entities: Vec<EntityState>,
 }
 
 /// Bitbox (1 byte) for input compression

@@ -11,7 +11,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use crate::protocol::{
     DisconnectPacket, InputPacket, InputState, NetworkID, PacketType, PingRequest, PingResponse, SpawnPacket,
-    StatePacket, WelcomePacket,
+    StatePacket, WelcomePacket, WorldStatePacket, EntityState,
 };
 
 // ------------------------------------------------------------------------
@@ -31,8 +31,6 @@ struct ServerState {
     addr_to_entity: HashMap<String, Entity>,
     /// Map of Client Address -> Assigned NetworkID (for disconnect broadcast)
     addr_to_id: HashMap<String, NetworkID>,
-    /// Last heartbeat timestamp for timeout handling
-    last_heartbeat: HashMap<String, std::time::Instant>,
     /// Track last sequence number per client for Packet Ordering (Lab 2)
     client_last_sequence: HashMap<String, u32>,
     /// Timer accumulation for broadcast frequency control (Optimisation Lab 2)
@@ -46,9 +44,15 @@ struct ServerConfig {
     tick_rate_hz: f64,
 }
 
+#[derive(Event)]
+struct DisconnectEvent {
+    client_addr: String,
+    network_id: NetworkID,
+    entity: Entity,
+}
+
 /// Component added to every entity that should be synchronized over the network.
 #[derive(Component)]
-#[allow(dead_code)] // Suppress warnings for now as requested
 struct NetworkedEntity {
     id: NetworkID,
     type_id: u32,
@@ -59,6 +63,13 @@ struct NetworkedEntity {
 struct PlayerInput {
     current: InputState,
     last_sequence: u32, // Added to keep track of sequence ID that generated the state
+}
+
+/// Component to track client connection details.
+#[derive(Component)]
+struct ClientConnection {
+    address: String,
+    last_heartbeat: std::time::Instant,
 }
 
 fn main() {
@@ -96,11 +107,11 @@ fn main() {
             clients: Vec::new(),
             addr_to_entity: HashMap::new(),
             addr_to_id: HashMap::new(), // Initialize new map
-            last_heartbeat: HashMap::new(),
             client_last_sequence: HashMap::new(),
             broadcast_timer: 0.0,
             broadcast_rate_hz,
         })
+        .add_observer(process_disconnects)
         .add_systems(Update, (handle_network, broadcast_state, handle_timeouts))
         .add_systems(FixedUpdate, move_players)
         .run();
@@ -110,16 +121,19 @@ fn main() {
 fn handle_network(
     mut commands: Commands,
     mut state: ResMut<ServerState>,
-    mut query: Query<(Entity, &mut PlayerInput, &NetworkedEntity, &Transform)>
+    mut query: Query<(Entity, &mut PlayerInput, &NetworkedEntity, &mut ClientConnection, &Transform)>
 ) {
     let mut buffer = [0u8; 1024];
 
     // Non-blocking receive loop.
     while let Some((size, sender_addr)) = state.socket.poll(&mut buffer) {
-        // Update heartbeat
-        state
-            .last_heartbeat
-            .insert(sender_addr.clone(), std::time::Instant::now());
+
+        // Update heartbeat if mapped
+        if let Some(entity) = state.addr_to_entity.get(&sender_addr) {
+            if let Ok((_, _, _, mut conn, _)) = query.get_mut(*entity) {
+                conn.last_heartbeat = std::time::Instant::now();
+            }
+        }
 
         // Peek at packet type (Byte 0)
         if size > 0 {
@@ -145,7 +159,7 @@ fn handle_network(
 
                                 // Apply to the correct entity
                                 if let Some(entity) = state.addr_to_entity.get(&sender_addr) {
-                                    if let Ok((_entry_entity, mut input_comp, _, _)) = query.get_mut(*entity) {
+                                    if let Ok((_entry_entity, mut input_comp, _, _, _)) = query.get_mut(*entity) {
                                         input_comp.current = latest_input;
                                         input_comp.last_sequence = input_packet.sequence; // Store sequence
 
@@ -183,28 +197,12 @@ fn handle_network(
                 // PacketType::Disconnect = 6
                 6 => {
                     if let Ok(disconnect) = bincode::deserialize::<DisconnectPacket>(&buffer[..size]) {
-                        info!("[Server] Disconnect received from Client {} (ID: {}).", sender_addr, disconnect.network_id);
-                        
-                        // Explicit removal
-                        if let Some(pos) = state.clients.iter().position(|x| *x == sender_addr) {
-                            state.clients.remove(pos);
-                        }
-
-                        // Broadcast Disconnect to others
-                        let broadcast_packet = DisconnectPacket {
-                            packet_type: PacketType::Disconnect as u8,
-                            network_id: disconnect.network_id,
-                        };
-                        if let Ok(data) = bincode::serialize(&broadcast_packet) {
-                            for client in &state.clients {
-                                let _ = state.socket.send(client, &data);
-                            }
-                        }
-
-                        if let Some(entity) = state.addr_to_entity.remove(&sender_addr) {
-                            state.addr_to_id.remove(&sender_addr);
-                            commands.entity(entity).despawn();
-                            info!("[Server] Despawned entity for disconnecting client.");
+                        if let Some(entity) = state.addr_to_entity.get(&sender_addr) {
+                            commands.trigger(DisconnectEvent {
+                                client_addr: sender_addr.clone(),
+                                network_id: disconnect.network_id,
+                                entity: *entity,
+                            });
                         }
                     }
                 }
@@ -233,7 +231,7 @@ fn handle_network(
             let _ = state.socket.send(&sender_addr, &welcome_data);
 
             // 1.2 Send Existing Entities to New Client
-            for (_, _, net_entity, transform) in query.iter() {
+            for (_, _, net_entity, _, transform) in query.iter() {
                 let spawn_existing = SpawnPacket {
                     packet_type: PacketType::Spawn as u8,
                     network_id: net_entity.id,
@@ -249,10 +247,14 @@ fn handle_network(
                 .spawn((
                     NetworkedEntity {
                         id: new_id,
-                        type_id: 1,
+                        type_id: 1, // Currently hardcoded to 1 for player
                     },
                     Transform::from_xyz(0.0, 0.0, 0.0),
                     PlayerInput::default(),
+                    ClientConnection {
+                        address: sender_addr.clone(),
+                        last_heartbeat: std::time::Instant::now(),
+                    },
                 ))
                 .id();
 
@@ -310,7 +312,7 @@ fn move_players(time: Res<Time<Fixed>>, mut query: Query<(&mut Transform, &Playe
 
 /// System: Broadcast State (Snapshot).
 /// Runs every frame (60Hz). In prod, maybe 20Hz.
-fn broadcast_state(mut state: ResMut<ServerState>, time: Res<Time>, query: Query<(&Transform, &NetworkedEntity, Option<&PlayerInput>)>) {
+fn broadcast_state(mut state: ResMut<ServerState>, time: Res<Time>, query: Query<(&Transform, &NetworkedEntity)>) {
     // Configurable variable for broadcast frequency (Hz).
     let broadcast_interval: f32 = 1.0 / state.broadcast_rate_hz;
 
@@ -320,81 +322,82 @@ fn broadcast_state(mut state: ResMut<ServerState>, time: Res<Time>, query: Query
     }
     state.broadcast_timer -= broadcast_interval;
 
-    for (transform, net_entity, input_opt) in query.iter() {
-        let last_seq = if let Some(input) = input_opt {
-            input.last_sequence
-        } else {
-            0
-        };
-
-        let packet = StatePacket {
-            packet_type: PacketType::StateUpdate as u8,
+    let mut entities = Vec::new();
+    for (transform, net_entity) in query.iter() {
+        entities.push(EntityState {
             network_id: net_entity.id,
+            // Provide exact type_id now that we fully use it
+            type_id: net_entity.type_id,
             x: transform.translation.x,
             y: transform.translation.y,
-            last_processed_sequence: last_seq,
+        });
+    }
+
+    for client in &state.clients {
+        let last_seq = state.client_last_sequence.get(client).cloned().unwrap_or(0);
+
+        let packet = WorldStatePacket {
+            packet_type: PacketType::WorldState as u8,
+            ack_sequence: last_seq,
+            entities: entities.clone(),
         };
 
         let data = bincode::serialize(&packet).unwrap();
-
-        // Send to everyone
-        for client in &state.clients {
-            let _ = state.socket.send(client, &data);
-        }
+        let _ = state.socket.send(client, &data);
     }
 }
 
 /// System: Handle Timeouts.
-fn handle_timeouts(mut commands: Commands, mut state: ResMut<ServerState>, time: Res<Time>) {
+fn handle_timeouts(
+    mut commands: Commands,
+    time: Res<Time>,
+    query: Query<(Entity, &ClientConnection, &NetworkedEntity)>
+) {
     // Check every second roughly
     if time.elapsed_secs() % 1.0 > 0.1 { return; }
 
-    // Timeout adjusted to 5s for responsiveness.
     let timeout_duration = Duration::from_secs(5);
     let now = std::time::Instant::now();
-    let mut to_remove_addrs = Vec::new();
 
-    for client in &state.clients {
-        if let Some(last) = state.last_heartbeat.get(client) {
-            if now.duration_since(*last) > timeout_duration {
-                to_remove_addrs.push(client.clone());
-            }
-        } else {
-             // Should verify why heartbeat not set (maybe initial connection)
-             // For now, safe default is to track from first packet.
-             // If never received packet, we can probably safely remove if connected long ago
-             // But let's assume heartbeat is set on first packet.
+    for (entity, conn, net_entity) in query.iter() {
+        if now.duration_since(conn.last_heartbeat) > timeout_duration {
+            commands.trigger(DisconnectEvent {
+                client_addr: conn.address.clone(),
+                network_id: net_entity.id,
+                entity,
+            });
         }
     }
+}
 
-    for client_addr in to_remove_addrs {
-        info!("[Server] Client {} timed out. Disconnecting.", client_addr);
+/// System: Process Disconnect Events.
+fn process_disconnects(
+    ev: On<DisconnectEvent>,
+    mut commands: Commands,
+    mut state: ResMut<ServerState>,
+) {
+    info!("[Server] Client {} (ID: {}) disconnected.", ev.client_addr, ev.network_id);
 
-        // Remove from clients list
-        if let Some(pos) = state.clients.iter().position(|x| *x == client_addr) {
-            state.clients.remove(pos);
-        }
+    if let Some(pos) = state.clients.iter().position(|x| *x == ev.client_addr) {
+        state.clients.remove(pos);
+    }
 
-        // Identify NetworkID for broadcast
-        let net_id_opt = state.addr_to_id.remove(&client_addr);
+    state.addr_to_id.remove(&ev.client_addr);
+    state.addr_to_entity.remove(&ev.client_addr);
+    state.client_last_sequence.remove(&ev.client_addr);
 
-        // Despawn entity
-        if let Some(entity) = state.addr_to_entity.remove(&client_addr) {
-            commands.entity(entity).despawn();
-        }
+    if commands.get_entity(ev.entity).is_ok() {
+        commands.entity(ev.entity).despawn();
+    }
 
-        // Broadcast Disconnect (Despawn) to remaining clients
-        if let Some(net_id) = net_id_opt {
-             let packet = DisconnectPacket {
-                packet_type: PacketType::Disconnect as u8,
-                network_id: net_id,
-            };
-            if let Ok(data) = bincode::serialize(&packet) {
-                // Send to all REMAINING clients
-                for other_client in &state.clients {
-                    let _ = state.socket.send(other_client, &data);
-                }
-            }
+    let packet = DisconnectPacket {
+        packet_type: PacketType::Disconnect as u8,
+        network_id: ev.network_id,
+    };
+    if let Ok(data) = bincode::serialize(&packet) {
+        // Send to remaining clients
+        for client in &state.clients {
+            let _ = state.socket.send(client, &data);
         }
     }
 }

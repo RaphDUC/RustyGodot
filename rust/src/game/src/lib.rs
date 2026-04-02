@@ -35,6 +35,21 @@ struct StatePacket {
     last_processed_sequence: u32,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct EntityState {
+    network_id: u32,
+    type_id: u32,
+    x: f32,
+    y: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorldStatePacket {
+    packet_type: u8,
+    ack_sequence: u32,
+    entities: Vec<EntityState>,
+}
+
 /// Bitbox (1 byte) for input compression
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
 #[repr(transparent)]
@@ -549,78 +564,72 @@ impl INode for NetworkManager {
                                  }
                              }
                          },
-                         // StateUpdate (Lab 3 Prep / Lab 2 Movement Replication)
-                         5 => {
-                             if let Ok(state_update) = bincode::deserialize::<StatePacket>(&buffer[0..size]) {
-                                 let net_id = state_update.network_id;
-                                 let px = state_update.x;
-                                 let py = state_update.y;
-                                 let ack_seq = state_update.last_processed_sequence;
+                         // WorldState Update (Optimised Broadcast)
+                         7 => {
+                             if let Ok(world_state) = bincode::deserialize::<WorldStatePacket>(&buffer[0..size]) {
+                                 let ack_seq = world_state.ack_sequence;
 
-                                 let server_pos = Vector2::new(px, py);
+                                 for entity_state in world_state.entities {
+                                     let net_id = entity_state.network_id;
+                                     let server_pos = Vector2::new(entity_state.x, entity_state.y);
 
-                                 if net_id == self.local_network_id {
-                                     // Server Reconciliation
-                                     if ack_seq > self.last_processed_sequence {
-                                         self.last_processed_sequence = ack_seq;
+                                     if net_id == self.local_network_id {
+                                         // Server Reconciliation
+                                         if ack_seq > self.last_processed_sequence {
+                                             self.last_processed_sequence = ack_seq;
 
-                                         if let Some(node) = self.network_objects.get_mut(&net_id) {
-                                             // 1. Snap to authoritative position
-                                             let mut current_sim_pos = server_pos;
+                                             if let Some(node) = self.network_objects.get_mut(&net_id) {
+                                                 // 1. Snap to authoritative position
+                                                 let mut current_sim_pos = server_pos;
 
-                                             // 2. Re-apply unacknowledged inputs
-                                             // seq corresponding to input_history[i] is self.sequence_id - 1 - i
-                                             let current_seq = self.sequence_id;
+                                                 // 2. Re-apply unacknowledged inputs
+                                                 let current_seq = self.sequence_id;
+                                                 let speed = 200.0;
+                                                 let delta_t = 1.0 / 60.0; // Server tick rate assumption
 
-                                             // Speed must match server exactly. Hardcoded for now but should be synchronized.
-                                             let speed = 200.0;
-                                             let delta_t = 1.0 / 60.0; // Server tick rate assumption
+                                                 for i in (0..self.input_history.len()).rev() {
+                                                     let seq_for_input = current_seq - 1 - (i as u32);
 
-                                             for i in (0..self.input_history.len()).rev() {
-                                                 let seq_for_input = current_seq - 1 - (i as u32);
+                                                     if seq_for_input > ack_seq {
+                                                         let input_state = self.input_history[i];
+                                                         let mut direction = Vector2::ZERO;
 
-                                                 if seq_for_input > ack_seq {
-                                                     let input_state = self.input_history[i];
-                                                     let mut direction = Vector2::ZERO;
+                                                         if (input_state.0 & (1 << 0)) != 0 { direction.y -= 1.0; } // UP
+                                                         if (input_state.0 & (1 << 1)) != 0 { direction.y += 1.0; } // DOWN
+                                                         if (input_state.0 & (1 << 2)) != 0 { direction.x -= 1.0; } // LEFT
+                                                         if (input_state.0 & (1 << 3)) != 0 { direction.x += 1.0; } // RIGHT
 
-                                                     if (input_state.0 & (1 << 0)) != 0 { direction.y -= 1.0; } // UP
-                                                     if (input_state.0 & (1 << 1)) != 0 { direction.y += 1.0; } // DOWN
-                                                     if (input_state.0 & (1 << 2)) != 0 { direction.x -= 1.0; } // LEFT
-                                                     if (input_state.0 & (1 << 3)) != 0 { direction.x += 1.0; } // RIGHT
+                                                         if direction != Vector2::ZERO {
+                                                             direction = direction.normalized();
+                                                         }
 
-                                                     if direction != Vector2::ZERO {
-                                                         direction = direction.normalized();
+                                                         current_sim_pos += direction * speed * delta_t;
                                                      }
+                                                 }
 
-                                                     current_sim_pos += direction * speed * delta_t;
+                                                 // Apply the reconciled position gracefully
+                                                 let predicted_dist = node.get_position().distance_to(current_sim_pos);
+                                                 if predicted_dist > self.correction_threshold {
+                                                    let new_pos = node.get_position().lerp(current_sim_pos, self.correction_smoothing);
+                                                    node.set_position(new_pos);
                                                  }
                                              }
-
-                                             // Apply the reconciled position gracefully
-                                             let predicted_dist = node.get_position().distance_to(current_sim_pos);
-                                             if predicted_dist > self.correction_threshold {
-                                                let new_pos = node.get_position().lerp(current_sim_pos, self.correction_smoothing);
-                                                node.set_position(new_pos);
-                                             } else {
-                                                // If deviation is small, client local physics is trusted for smoothness.
-                                                // Setting exactly to current_sim_pos can cause micro-jitters if local physics tick != network tick
-                                             }
                                          }
-                                     }
-                                 } else {
-                                     // Remote Player: Store in Interpolation Buffer rather than applying directly
-                                     let receive_time = current_time;
-                                     let buffer = self.state_buffers.entry(net_id).or_insert_with(VecDeque::new);
+                                     } else {
+                                         // Remote Player: Store in Interpolation Buffer rather than applying directly
+                                         let receive_time = current_time;
+                                         let buffer = self.state_buffers.entry(net_id).or_insert_with(VecDeque::new);
 
-                                     // Add to buffer
-                                     buffer.push_back(StateSnapshot {
-                                         timestamp: receive_time,
-                                         pos: server_pos,
-                                     });
+                                         // Add to buffer
+                                         buffer.push_back(StateSnapshot {
+                                             timestamp: receive_time,
+                                             pos: server_pos,
+                                         });
 
-                                     // Keep buffer size manageable (e.g. max 20 snapshots)
-                                     if buffer.len() > 20 {
-                                         buffer.pop_front();
+                                         // Keep buffer size manageable
+                                         if buffer.len() > 20 {
+                                             buffer.pop_front();
+                                         }
                                      }
                                  }
                              }
