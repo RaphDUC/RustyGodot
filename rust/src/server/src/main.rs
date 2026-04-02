@@ -229,13 +229,8 @@ fn handle_network(
                 packet_type: PacketType::Welcome as u8,
                 network_id: new_id,
             };
-            let welcome_data = unsafe {
-                std::slice::from_raw_parts(
-                    &welcome as *const WelcomePacket as *const u8,
-                    std::mem::size_of::<WelcomePacket>(),
-                )
-            };
-            let _ = state.socket.send(&sender_addr, welcome_data);
+            let welcome_data = bincode::serialize(&welcome).unwrap();
+            let _ = state.socket.send(&sender_addr, &welcome_data);
 
             // 1.2 Send Existing Entities to New Client
             for (_, _, net_entity, transform) in query.iter() {
@@ -246,13 +241,8 @@ fn handle_network(
                     x: transform.translation.x,
                     y: transform.translation.y,
                 };
-                let spawn_data = unsafe {
-                    std::slice::from_raw_parts(
-                        &spawn_existing as *const SpawnPacket as *const u8,
-                        std::mem::size_of::<SpawnPacket>(),
-                    )
-                };
-                let _ = state.socket.send(&sender_addr, spawn_data);
+                let spawn_data = bincode::serialize(&spawn_existing).unwrap();
+                let _ = state.socket.send(&sender_addr, &spawn_data);
             }
 
             let entity = commands
@@ -276,15 +266,10 @@ fn handle_network(
                 x: 0.0,
                 y: 0.0,
             };
-            let data = unsafe {
-                std::slice::from_raw_parts(
-                    &packet as *const SpawnPacket as *const u8,
-                    std::mem::size_of::<SpawnPacket>(),
-                )
-            };
+            let bincode_data = bincode::serialize(&packet).unwrap();
 
             for client_addr in &state.clients {
-                let _ = state.socket.send(client_addr, data);
+                let _ = state.socket.send(client_addr, &bincode_data);
             }
 
             info!("[Server] Spawning Entity ID {} for all clients.", new_id);
@@ -350,16 +335,11 @@ fn broadcast_state(mut state: ResMut<ServerState>, time: Res<Time>, query: Query
             last_processed_sequence: last_seq,
         };
 
-        let data = unsafe {
-            std::slice::from_raw_parts(
-                &packet as *const StatePacket as *const u8,
-                std::mem::size_of::<StatePacket>(),
-            )
-        };
+        let data = bincode::serialize(&packet).unwrap();
 
         // Send to everyone
         for client in &state.clients {
-            let _ = state.socket.send(client, data);
+            let _ = state.socket.send(client, &data);
         }
     }
 }

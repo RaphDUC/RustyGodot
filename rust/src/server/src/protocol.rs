@@ -22,7 +22,6 @@ pub enum PacketType {
 
 /// Packet sent by the server to assigning a NetworkID to a connecting client.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-#[repr(C, packed)]
 pub struct WelcomePacket {
     pub packet_type: u8, // = 0
     pub network_id: NetworkID,
@@ -41,7 +40,6 @@ pub struct WelcomePacket {
 /// - x:           f32 (4 bytes, IEEE 754)
 /// - y:           f32 (4 bytes, IEEE 754)
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-#[repr(C, packed)]
 pub struct SpawnPacket {
     pub packet_type: u8,
     pub network_id: NetworkID,
@@ -53,7 +51,6 @@ pub struct SpawnPacket {
 /// Packet sent by Server to *ALL* clients to update an entity's position.
 /// This corresponds to the "State" or "Snapshot" of the Lab 3 preparation.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-#[repr(C, packed)]
 pub struct StatePacket {
     pub packet_type: u8, // = 5
     pub network_id: NetworkID,

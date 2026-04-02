@@ -10,9 +10,8 @@ struct MyExtension;
 unsafe impl ExtensionLibrary for MyExtension {}
 
 /// --- PROTOCOL DEFINITION ---
-/// Must match the server's struct layout exactly (Binary Protocol).
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)] // Added Serialize, Deserialize
+/// Must match the server's exact protocol
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct SpawnPacket {
     pub packet_type: u8,
     pub network_id: u32,
@@ -21,13 +20,13 @@ struct SpawnPacket {
     pub y: f32,
 }
 
-#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct WelcomePacket {
     packet_type: u8,
     network_id: u32,
 }
 
-#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct StatePacket {
     packet_type: u8,
     network_id: u32,
@@ -151,12 +150,19 @@ struct NetworkManager {
     #[export]
     simulated_latency_ms: f64, // Artificial lag in milliseconds for testing
 
+    #[export]
+    simulated_jitter_ms: f64, // Artificial jitter in milliseconds for Clock Sync testing
+
+    // --- Clock Sync ---
+    rtt_history: VecDeque<f64>,
+    smoothed_rtt: f64,
+    clock_offset: f64,
+
     incoming_queue: Vec<DelayedPacket>,
 
     base: Base<Node>,
 }
 
-/// Note: We moved critical initialization (socket, registry) to `init()` to ensure they are set up even if GDScript overrides `_ready()`.
 #[godot_api]
 impl NetworkManager {
     // Porting signals from C++:
@@ -314,6 +320,22 @@ impl NetworkManager {
         self.sequence_id += 1;
     }
 
+    // --- CLOCK SYNC ACCESSORS FOR GODOT ---
+    #[func]
+    fn get_estimated_server_time(&self) -> f64 {
+        let current_time = godot::classes::Time::singleton().get_ticks_msec() as f64;
+        current_time + self.clock_offset
+    }
+
+    #[func]
+    fn get_smoothed_rtt(&self) -> f64 {
+        self.smoothed_rtt
+    }
+
+    #[func]
+    fn get_clock_offset(&self) -> f64 {
+        self.clock_offset
+    }
 }
 
 #[godot_api]
@@ -353,6 +375,10 @@ impl INode for NetworkManager {
             correction_threshold: 40.0,
             correction_smoothing: 0.1,
             simulated_latency_ms: 0.0,
+            simulated_jitter_ms: 0.0,
+            rtt_history: VecDeque::with_capacity(10),
+            smoothed_rtt: 0.0,
+            clock_offset: 0.0,
             incoming_queue: Vec::new(),
         }
     }
@@ -398,7 +424,16 @@ impl INode for NetworkManager {
 
             // Non-blocking poll loop: Instead of processing immediately, we add to queue
             while let Some((size, sender_addr)) = socket.poll(&mut buffer) {
-                let deliver_time = current_time + self.simulated_latency_ms;
+                // Pseudo-random jitter simulation
+                let t = current_time;
+                let random_factor = ((t * 0.01).sin() + (t * 0.032).sin()) * 0.5; // Value between roughly -1.0 and 1.0
+                let jitter = random_factor * self.simulated_jitter_ms;
+
+                let mut deliver_time = current_time + self.simulated_latency_ms + jitter;
+                if deliver_time < current_time {
+                    deliver_time = current_time; // Can't travel back in time
+                }
+
                 self.incoming_queue.push(DelayedPacket {
                     deliver_time,
                     sender_addr,
@@ -441,11 +476,8 @@ impl INode for NetworkManager {
                 match packet_type {
                          // Welcome (Lab 2 Fix)
                          0 => {
-                             if size >= std::mem::size_of::<WelcomePacket>() {
-                                let net_id = unsafe {
-                                    let raw = buffer.as_ptr() as *const WelcomePacket;
-                                    std::ptr::read_unaligned(std::ptr::addr_of!((*raw).network_id))
-                                };
+                             if let Ok(welcome) = bincode::deserialize::<WelcomePacket>(&buffer[0..size]) {
+                                let net_id = welcome.network_id;
 
                                 // RECONNECTION / TIMEOUT MANAGEMENT
                                 // If we already had a different local ID, we were disconnected/reconnected.
@@ -472,49 +504,58 @@ impl INode for NetworkManager {
                          },
                          // SPAWN (Lab 1)
                          1 => {
-                             if size >= std::mem::size_of::<SpawnPacket>() {
-                                let (_, net_id, t_id, px, py) = unsafe {
-                                    let raw = buffer.as_ptr() as *const SpawnPacket;
-                                    (
-                                        std::ptr::read_unaligned(std::ptr::addr_of!((*raw).packet_type)),
-                                        std::ptr::read_unaligned(std::ptr::addr_of!((*raw).network_id)),
-                                        std::ptr::read_unaligned(std::ptr::addr_of!((*raw).type_id)),
-                                        std::ptr::read_unaligned(std::ptr::addr_of!((*raw).x)),
-                                        std::ptr::read_unaligned(std::ptr::addr_of!((*raw).y)),
-                                    )
-                                };
+                             if let Ok(spawn) = bincode::deserialize::<SpawnPacket>(&buffer[0..size]) {
+                                let net_id = spawn.network_id;
+                                let t_id = spawn.type_id;
+                                let px = spawn.x;
+                                let py = spawn.y;
+
                                 godot_print!("[Client] Queueing Spawn: NetID={} TypeID={} Pos=({},{})", net_id, t_id, px, py);
                                 spawns_to_process.push((net_id, t_id, px, py));
                              } else {
-                                godot_print!("[Client] Error: SPAWN packet too small ({} < {})", size, std::mem::size_of::<SpawnPacket>());
+                                godot_print!("[Client] Error: SPAWN packet deserialization failed");
                              }
                          },
                          // PingResponse (Lab 2)
                          4 => {
                              if let Ok(pong) = bincode::deserialize::<PingResponse>(&buffer[0..size]) {
-                                 let t3 = godot::classes::Time::singleton().get_ticks_msec(); // Client Receive Time
-                                 let rtt = t3 - pong.t0; // RTT = t3 - t1 (client send time)
-                                 // Note: pong.t1 is Server time, useful for Clock Synchronization (offset = t1 - t0 - RTT/2), but Lab 2 asks for RTT.
-                                 godot_print!("[Ping #{}] RTT = {} ms", pong.id, rtt);
-                                 
-                                 // Bonus: Display RTT in the window title for debug
-                                 // let title = format!("RustyGodot Client - RTT: {} ms", rtt);
-                                 // DisplayServer::singleton().window_set_title(title.into());
+                                 let t3 = current_time; // Client Receive Time
+                                 let rtt = t3 - (pong.t0 as f64); // RTT = t3 - t1 (client send time)
+
+                                 // Update RTT Moving Average
+                                 self.rtt_history.push_back(rtt);
+                                 if self.rtt_history.len() > 10 {
+                                     self.rtt_history.pop_front();
+                                 }
+
+                                 let rtt_sum: f64 = self.rtt_history.iter().sum();
+                                 self.smoothed_rtt = rtt_sum / (self.rtt_history.len() as f64);
+
+                                 // Calculate Clock Offset
+                                 let server_time = pong.t1 as f64;
+                                 let current_offset = server_time - t3 - (self.smoothed_rtt / 2.0);
+
+                                 if self.clock_offset == 0.0 {
+                                     self.clock_offset = current_offset; // Initialize
+                                 } else {
+                                     // Exponential Moving Average for offset smoothing
+                                     self.clock_offset = self.clock_offset * 0.8 + current_offset * 0.2;
+                                 }
+
+                                 // Print periodically or when asked
+                                 if pong.id % 2 == 0 {
+                                     godot_print!("[Clock Sync] RTT: {:.1}ms (Smoothed: {:.1}ms) | Offset: {:.1}ms | Est. Server Time: {:.1}",
+                                         rtt, self.smoothed_rtt, self.clock_offset, t3 + self.clock_offset);
+                                 }
                              }
                          },
                          // StateUpdate (Lab 3 Prep / Lab 2 Movement Replication)
                          5 => {
-                             if size >= std::mem::size_of::<StatePacket>() {
-                                 // Unsafe read for packed struct
-                                 let (net_id, px, py, ack_seq) = unsafe {
-                                     let raw = buffer.as_ptr() as *const StatePacket;
-                                     (
-                                         std::ptr::read_unaligned(std::ptr::addr_of!((*raw).network_id)),
-                                         std::ptr::read_unaligned(std::ptr::addr_of!((*raw).x)),
-                                         std::ptr::read_unaligned(std::ptr::addr_of!((*raw).y)),
-                                         std::ptr::read_unaligned(std::ptr::addr_of!((*raw).last_processed_sequence)),
-                                     )
-                                 };
+                             if let Ok(state_update) = bincode::deserialize::<StatePacket>(&buffer[0..size]) {
+                                 let net_id = state_update.network_id;
+                                 let px = state_update.x;
+                                 let py = state_update.y;
+                                 let ack_seq = state_update.last_processed_sequence;
 
                                  let server_pos = Vector2::new(px, py);
 
